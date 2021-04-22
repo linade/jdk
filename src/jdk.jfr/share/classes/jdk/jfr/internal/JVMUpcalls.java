@@ -53,6 +53,9 @@ final class JVMUpcalls {
     static byte[] onRetransform(long traceId, boolean dummy, Class<?> clazz, byte[] oldBytes) throws Throwable {
         try {
             if (jdk.internal.event.Event.class.isAssignableFrom(clazz) && !Modifier.isAbstract(clazz.getModifiers())) {
+                if (Utils.shouldSkipBytecode(clazz.getName(), clazz.getSuperclass())) {
+                    return oldBytes;
+                }
                 EventHandler handler = Utils.getHandler(clazz.asSubclass(jdk.internal.event.Event.class));
                 if (handler == null) {
                     Logger.log(LogTag.JFR_SYSTEM, LogLevel.INFO, "No event handler found for " + clazz.getName() + ". Ignoring instrumentation request.");
@@ -96,6 +99,9 @@ final class JVMUpcalls {
         try {
             EventInstrumentation ei = new EventInstrumentation(superClass, oldBytes, traceId);
             eventName = ei.getEventName();
+            if (Utils.shouldSkipBytecode(eventName, superClass)) {
+                return oldBytes;
+            }
             if (!forceInstrumentation) {
                 // Assume we are recording
                 MetadataRepository mr = MetadataRepository.getInstance();
