@@ -88,6 +88,22 @@ class HandshakeState {
   // Set to the thread executing the handshake operation.
   Thread* _active_handshaker;
 
+  class SelfProcessingReentranceGuard {
+    HandshakeState* const _handshake_state;
+   public:
+    SelfProcessingReentranceGuard(HandshakeState* handshake_state) :
+      _handshake_state(handshake_state) {
+      assert(_handshake_state->_self_processing == false, "Must be");
+      _handshake_state->_self_processing = true;
+    }
+    ~SelfProcessingReentranceGuard() {
+      assert(_handshake_state->_self_processing == true, "Must be");
+      _handshake_state->_self_processing = false;
+    }
+  };
+  friend SelfProcessingReentranceGuard;
+  bool _self_processing;
+
   bool claim_handshake();
   bool possibly_can_process_handshake();
   bool can_process_handshake();
@@ -125,6 +141,9 @@ class HandshakeState {
   // while handshake operations are being executed, the _handshakee
   // must take slow path, process_by_self(), if _lock is held.
   bool should_process() {
+    if (_self_processing) {
+      return false;
+    }
     // The holder of the _lock can add an asynchronous handshake to queue.
     // To make sure it is seen by the handshakee, the handshakee must first
     // check the _lock, and if held go to slow path.

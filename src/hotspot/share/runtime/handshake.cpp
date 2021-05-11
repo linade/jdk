@@ -406,6 +406,7 @@ HandshakeState::HandshakeState(JavaThread* target) :
   _queue(),
   _lock(Monitor::leaf, "HandshakeState", Mutex::_allow_vm_block_flag, Monitor::_safepoint_check_never),
   _active_handshaker(),
+  _self_processing(false),
   _suspended(false),
   _async_suspend_handshake(false)
 {
@@ -470,6 +471,7 @@ bool HandshakeState::process_by_self() {
 
 bool HandshakeState::process_self_inner() {
   while (should_process()) {
+    SelfProcessingReentranceGuard sprg(this);
     MutexLocker ml(&_lock, Mutex::_no_safepoint_check_flag);
     HandshakeOperation* op = pop_for_self();
     if (op != NULL) {
