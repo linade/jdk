@@ -481,12 +481,16 @@ bool HandshakeState::process_self_inner() {
       if (!async) {
         HandleMark hm(_handshakee);
         PreserveExceptionMark pem(_handshakee);
+        _active_handshaker = Thread::current();
         op->do_handshake(_handshakee);
+        _active_handshaker = NULL;
       } else {
         // An asynchronous handshake may put the JavaThread in blocked state (safepoint safe).
         // The destructor ~PreserveExceptionMark touches the exception oop so it must not be executed,
         // since a safepoint may be in-progress when returning from the async handshake.
+        _active_handshaker = Thread::current();
         op->do_handshake(_handshakee);
+        _active_handshaker = NULL;
         log_handshake_info(((AsyncHandshakeOperation*)op)->start_time(), op->name(), 1, 0, "asynchronous");
         delete op;
         return true; // Must check for safepoints
