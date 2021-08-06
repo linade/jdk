@@ -42,6 +42,7 @@
 #include "gc/g1/g1RemSet.hpp"
 #include "gc/g1/g1ServiceThread.hpp"
 #include "gc/g1/g1SharedDirtyCardQueue.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/g1_globals.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "gc/g1/heapRegionManager.inline.hpp"
@@ -626,7 +627,8 @@ double G1RemSet::sampling_task_vtime() {
 
 // Helper class to scan and detect ranges of cards that need to be scanned on the
 // card table.
-class G1CardTableScanner : public StackObj {
+// Scan backwards to reduce repetitive work in BOT.
+class G1CardTableBackwardScanner : public StackObj {
 public:
   typedef CardTable::CardValue CardValue;
 
@@ -640,7 +642,8 @@ private:
   static const size_t ExpandedToScanMask = G1CardTable::WordAlreadyScanned;
 
   bool cur_addr_aligned() const {
-    return ((uintptr_t)_cur_addr) % sizeof(size_t) == 0;
+    // When scanning backwards, we need an alignment from the back of a word.
+    return ((uintptr_t)(_cur_addr + 1)) % sizeof(size_t) == 0;
   }
 
   bool cur_card_is_dirty() const {
@@ -648,29 +651,36 @@ private:
     return (value & ToScanMask) == 0;
   }
 
+  size_t* cur_word_of_cards_addr() const {
+    return (size_t*)align_down(_cur_addr, sizeof(size_t));
+  }
+
   bool cur_word_of_cards_contains_any_dirty_card() const {
     assert(cur_addr_aligned(), "Current address should be aligned");
-    size_t const value = *(size_t*)_cur_addr;
+    size_t const value = *cur_word_of_cards_addr();
     return (~value & ExpandedToScanMask) != 0;
   }
 
   bool cur_word_of_cards_all_dirty_cards() const {
-    size_t const value = *(size_t*)_cur_addr;
+    size_t const value = *cur_word_of_cards_addr();
     return value == G1CardTable::WordAllDirty;
   }
 
   size_t get_and_advance_pos() {
-    _cur_addr++;
-    return pointer_delta(_cur_addr, _base_addr, sizeof(CardValue)) - 1;
+    // Underflow is fine.
+    size_t delta = (((uintptr_t)_cur_addr) - ((uintptr_t)_base_addr)) / sizeof(CardValue);
+    _cur_addr--;
+    return delta;
   }
 
 public:
-  G1CardTableScanner(CardValue* start_card, size_t size) :
+  G1CardTableBackwardScanner(CardValue* start_card, size_t size) :
     _base_addr(start_card),
-    _cur_addr(start_card),
+    _cur_addr(start_card + size - 1),
     _end_addr(start_card + size) {
 
     assert(is_aligned(start_card, sizeof(size_t)), "Unaligned start addr " PTR_FORMAT, p2i(start_card));
+    assert(size != 0, "Zero cards");
     assert(is_aligned(size, sizeof(size_t)), "Unaligned size " SIZE_FORMAT, size);
   }
 
@@ -679,49 +689,49 @@ public:
       if (cur_card_is_dirty()) {
         return get_and_advance_pos();
       }
-      _cur_addr++;
+      _cur_addr--;
     }
 
     assert(cur_addr_aligned(), "Current address should be aligned now.");
-    while (_cur_addr != _end_addr) {
+    while (_cur_addr != (_base_addr - 1)) {
       if (cur_word_of_cards_contains_any_dirty_card()) {
         for (size_t i = 0; i < sizeof(size_t); i++) {
           if (cur_card_is_dirty()) {
             return get_and_advance_pos();
           }
-          _cur_addr++;
+          _cur_addr--;
         }
         assert(false, "Should not reach here given we detected a dirty card in the word.");
       }
-      _cur_addr += sizeof(size_t);
+      _cur_addr -= sizeof(size_t);
     }
-    return get_and_advance_pos();
+    return (size_t)-1UL;
   }
 
   size_t find_next_non_dirty() {
-    assert(_cur_addr <= _end_addr, "Not allowed to search for marks after area.");
+    assert(_cur_addr >= _base_addr - 1, "Not allowed to search for marks before area.");
 
     while (!cur_addr_aligned()) {
       if (!cur_card_is_dirty()) {
         return get_and_advance_pos();
       }
-      _cur_addr++;
+      _cur_addr--;
     }
 
     assert(cur_addr_aligned(), "Current address should be aligned now.");
-    while (_cur_addr != _end_addr) {
+    while (_cur_addr != (_base_addr - 1)) {
       if (!cur_word_of_cards_all_dirty_cards()) {
         for (size_t i = 0; i < sizeof(size_t); i++) {
           if (!cur_card_is_dirty()) {
             return get_and_advance_pos();
           }
-          _cur_addr++;
+          _cur_addr--;
         }
         assert(false, "Should not reach here given we detected a non-dirty card in the word.");
       }
-      _cur_addr += sizeof(size_t);
+      _cur_addr -= sizeof(size_t);
     }
-    return get_and_advance_pos();
+    return (size_t)-1UL;
   }
 };
 
@@ -745,6 +755,8 @@ public:
       if (_cur_claim >= HeapRegion::CardsPerRegion) {
         return false;
       }
+      _cur_claim = HeapRegion::CardsPerRegion - _cur_claim;
+      _cur_claim -= MIN2(size(), _cur_claim);
       if (_scan_state->chunk_needs_scan(_region_idx, _cur_claim)) {
         return true;
       }
@@ -776,7 +788,7 @@ class G1ScanHRForRegionClosure : public HeapRegionClosure {
   Tickspan _rem_set_root_scan_time;
   Tickspan _rem_set_trim_partially_time;
 
-  // The address to which this thread already scanned (walked the heap) up to during
+  // The address to which this thread already scanned (walked the heap) during
   // card scanning (exclusive).
   HeapWord* _scanned_to;
   G1CardTable::CardValue _scanned_card_value;
@@ -785,9 +797,10 @@ class G1ScanHRForRegionClosure : public HeapRegionClosure {
     HeapRegion* const card_region = _g1h->region_at(region_idx_for_card);
     G1ScanCardClosure card_cl(_g1h, _pss);
 
-    HeapWord* const scanned_to = card_region->oops_on_memregion_seq_iterate_careful<true>(mr, &card_cl);
+    HeapWord* const scanned_to = card_region->oops_on_memregion_seq_iterate_careful<true, true>(mr, &card_cl);
     assert(scanned_to != NULL, "Should be able to scan range");
-    assert(scanned_to >= mr.end(), "Scanned to " PTR_FORMAT " less than range " PTR_FORMAT, p2i(scanned_to), p2i(mr.end()));
+    assert(scanned_to <= mr.start(), "Scanned to " PTR_FORMAT " larger than start " PTR_FORMAT,
+           p2i(scanned_to), p2i(mr.start()));
 
     _pss->trim_queue_partially();
     return scanned_to;
@@ -805,11 +818,11 @@ class G1ScanHRForRegionClosure : public HeapRegionClosure {
       return;
     }
 
-    HeapWord* scan_end = MIN2(card_start + (num_cards << BOTConstants::LogN_words), top);
-    if (_scanned_to >= scan_end) {
+    if (_scanned_to <= card_start) {
       return;
     }
-    MemRegion mr(MAX2(card_start, _scanned_to), scan_end);
+    HeapWord* scan_end = MIN2(card_start + (num_cards << BOTConstants::LogN_words), top);
+    MemRegion mr(card_start, MIN2(scan_end, _scanned_to));
     _scanned_to = scan_memregion(region_idx_for_card, mr);
 
     _cards_scanned += num_cards;
@@ -821,7 +834,7 @@ class G1ScanHRForRegionClosure : public HeapRegionClosure {
     _blocks_scanned++;
   }
 
-   void scan_heap_roots(HeapRegion* r) {
+  void scan_heap_roots(HeapRegion* r) {
     EventGCPhaseParallel event;
     uint const region_idx = r->hrm_index();
 
@@ -829,28 +842,29 @@ class G1ScanHRForRegionClosure : public HeapRegionClosure {
 
     G1CardTableChunkClaimer claim(_scan_state, region_idx);
 
-    // Set the current scan "finger" to NULL for every heap region to scan. Since
-    // the claim value is monotonically increasing, the check to not scan below this
+    // Set the current scan "finger" to end for every heap region to scan. Since
+    // the claim value is monotonically decreasing, the check to not scan above this
     // will filter out objects spanning chunks within the region too then, as opposed
     // to resetting this value for every claim.
-    _scanned_to = NULL;
+    _scanned_to = r->end();
 
     while (claim.has_next()) {
       size_t const region_card_base_idx = ((size_t)region_idx << HeapRegion::LogCardsPerRegion) + claim.value();
       CardTable::CardValue* const base_addr = _ct->byte_for_index(region_card_base_idx);
 
-      G1CardTableScanner scan(base_addr, claim.size());
+      G1CardTableBackwardScanner scan(base_addr, claim.size());
 
+      // We are iterating backwards, so the cards dirty are in (last_scan_idx, first_scan_idx].
       size_t first_scan_idx = scan.find_next_dirty();
-      while (first_scan_idx != claim.size()) {
+      while (first_scan_idx != (size_t)-1UL) {
         assert(*_ct->byte_for_index(region_card_base_idx + first_scan_idx) <= 0x1, "is %d at region %u idx " SIZE_FORMAT, *_ct->byte_for_index(region_card_base_idx + first_scan_idx), region_idx, first_scan_idx);
 
         size_t const last_scan_idx = scan.find_next_non_dirty();
-        size_t const len = last_scan_idx - first_scan_idx;
+        size_t const len = first_scan_idx - last_scan_idx;
 
-        do_card_block(region_idx, region_card_base_idx + first_scan_idx, len);
+        do_card_block(region_idx, region_card_base_idx + last_scan_idx + 1, len);
 
-        if (last_scan_idx == claim.size()) {
+        if (last_scan_idx == (size_t)-1UL) {
           break;
         }
 
@@ -912,7 +926,10 @@ void G1RemSet::scan_heap_roots(G1ParScanThreadState* pss,
                                G1GCPhaseTimes::GCParPhases objcopy_phase,
                                bool remember_already_scanned_cards) {
   G1ScanHRForRegionClosure cl(_scan_state, pss, worker_id, scan_phase, remember_already_scanned_cards);
+  size_t cc = G1ThreadLocalData::get_cc(Thread::current());
   _scan_state->iterate_dirty_regions_from(&cl, worker_id);
+  cc = G1ThreadLocalData::get_cc(Thread::current()) - cc;
+  log_error(gc)("slow path count %ld", cc);
 
   G1GCPhaseTimes* p = _g1p->phase_times();
 
@@ -1671,7 +1688,8 @@ void G1RemSet::refine_card_concurrently(CardValue* const card_ptr,
   assert(!dirty_region.is_empty(), "sanity");
 
   G1ConcurrentRefineOopClosure conc_refine_cl(_g1h, worker_id);
-  if (r->oops_on_memregion_seq_iterate_careful<false>(dirty_region, &conc_refine_cl) != NULL) {
+  if (r->oops_on_memregion_seq_iterate_careful<false, false>(dirty_region, &conc_refine_cl) != NULL)
+  {
     return;
   }
 

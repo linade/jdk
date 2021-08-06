@@ -273,8 +273,8 @@ private:
   // handling for concurrent processing encountering an in-progress allocation.
   // Returns the address after the last actually scanned or NULL if the area could
   // not be scanned (That should only happen when invoked concurrently with the
-  // mutator).
-  template <class Closure, bool is_gc_active>
+  // mutator). If return_start is set, however, return the start of the humongous obj.
+  template <class Closure, bool return_start, bool is_gc_active>
   inline HeapWord* do_oops_on_memregion_in_humongous(MemRegion mr,
                                                      Closure* cl,
                                                      G1CollectedHeap* g1h);
@@ -562,8 +562,9 @@ public:
   // This region must be old or humongous.
   // Returns the next unscanned address if the designated objects were successfully
   // processed, NULL if an unparseable part of the heap was encountered (That should
-  // only happen when invoked concurrently with the mutator).
-  template <bool is_gc_active, class Closure>
+  // only happen when invoked concurrently with the mutator). When return_start is set,
+  // however, return the start of the earliest iterated oop (used in backward scanning).
+  template <bool return_start, bool is_gc_active, class Closure>
   inline HeapWord* oops_on_memregion_seq_iterate_careful(MemRegion mr, Closure* cl);
 
   // Routines for managing a list of code roots (attached to the

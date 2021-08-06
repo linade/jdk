@@ -36,10 +36,11 @@ class G1ThreadLocalData {
 private:
   SATBMarkQueue _satb_mark_queue;
   G1DirtyCardQueue _dirty_card_queue;
+  size_t cc;
 
   G1ThreadLocalData() :
       _satb_mark_queue(&G1BarrierSet::satb_mark_queue_set()),
-      _dirty_card_queue(&G1BarrierSet::dirty_card_queue_set()) {}
+      _dirty_card_queue(&G1BarrierSet::dirty_card_queue_set()), cc(0) {}
 
   static G1ThreadLocalData* data(Thread* thread) {
     assert(UseG1GC, "Sanity");
@@ -61,6 +62,11 @@ public:
 
   static void destroy(Thread* thread) {
     data(thread)->~G1ThreadLocalData();
+  }
+
+  static void inc_cc(Thread* t) { data(t)->cc++; }
+  static size_t& get_cc(Thread* t) {
+    return data(t)->cc;
   }
 
   static SATBMarkQueue& satb_mark_queue(Thread* thread) {

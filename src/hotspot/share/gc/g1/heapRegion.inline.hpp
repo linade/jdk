@@ -289,7 +289,7 @@ inline bool HeapRegion::in_collection_set() const {
   return G1CollectedHeap::heap()->is_in_cset(this);
 }
 
-template <class Closure, bool is_gc_active>
+template <class Closure, bool return_start, bool is_gc_active>
 HeapWord* HeapRegion::do_oops_on_memregion_in_humongous(MemRegion mr,
                                                         Closure* cl,
                                                         G1CollectedHeap* g1h) {
@@ -313,8 +313,8 @@ HeapWord* HeapRegion::do_oops_on_memregion_in_humongous(MemRegion mr,
   // humongous object.
   if (g1h->is_obj_dead(obj, sr)) {
     // The object is dead. There can be no other object in this region, so return
-    // the end of that region.
-    return end();
+    // the end of that region or the start of the object.
+    return return_start ? sr->bottom() : end();
   }
   if (obj->is_objArray() || (sr->bottom() < mr.start())) {
     // objArrays are always marked precisely, so limit processing
@@ -324,7 +324,7 @@ HeapWord* HeapRegion::do_oops_on_memregion_in_humongous(MemRegion mr,
     // objects.  That should be rare, so not worth checking for;
     // instead let it fall out from the bounded iteration.
     obj->oop_iterate(cl, mr);
-    return mr.end();
+    return return_start ? mr.start() : mr.end();
   } else {
     // If obj is not an objArray and mr contains the start of the
     // obj, then this could be an imprecise mark, and we need to
@@ -332,12 +332,12 @@ HeapWord* HeapRegion::do_oops_on_memregion_in_humongous(MemRegion mr,
     int size = obj->oop_iterate_size(cl);
     // We have scanned to the end of the object, but since there can be no objects
     // after this humongous object in the region, we can return the end of the
-    // region if it is greater.
-    return MAX2(cast_from_oop<HeapWord*>(obj) + size, mr.end());
+    // region if it is greater, or the start of the object.
+    return return_start ? sr->bottom() : (MAX2(cast_from_oop<HeapWord*>(obj) + size, mr.end()));
   }
 }
 
-template <bool is_gc_active, class Closure>
+template <bool return_start, bool is_gc_active, class Closure>
 HeapWord* HeapRegion::oops_on_memregion_seq_iterate_careful(MemRegion mr,
                                                             Closure* cl) {
   assert(MemRegion(bottom(), end()).contains(mr), "Card region not in heap region");
@@ -345,7 +345,7 @@ HeapWord* HeapRegion::oops_on_memregion_seq_iterate_careful(MemRegion mr,
 
   // Special handling for humongous regions.
   if (is_humongous()) {
-    return do_oops_on_memregion_in_humongous<Closure, is_gc_active>(mr, cl, g1h);
+    return do_oops_on_memregion_in_humongous<Closure, return_start, is_gc_active>(mr, cl, g1h);
   }
   assert(is_old() || is_archive(), "Wrongly trying to iterate over region %u type %s", _hrm_index, get_type_str());
 
@@ -362,6 +362,8 @@ HeapWord* HeapRegion::oops_on_memregion_seq_iterate_careful(MemRegion mr,
   // Update BOT as needed while finding start of (possibly dead)
   // object containing the start of the region.
   HeapWord* cur = block_start(start);
+  HeapWord* iterated_start = cur;
+  bool precise_start = true;
 
 #ifdef ASSERT
   {
@@ -397,10 +399,19 @@ HeapWord* HeapRegion::oops_on_memregion_seq_iterate_careful(MemRegion mr,
       } else {
         obj->oop_iterate(cl, mr);
         is_precise = true;
+        if (precise_start) {
+          // At the very beginning of the block we have a precise start (>= block start).
+          iterated_start = start;
+        }
       }
     }
+    precise_start = false;
     if (cur >= end) {
-      return is_precise ? end : cur;
+      if (return_start) {
+        return iterated_start;
+      } else {
+        return is_precise ? end : cur;
+      }
     }
   }
 }

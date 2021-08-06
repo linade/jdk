@@ -25,6 +25,7 @@
 #include "precompiled.hpp"
 #include "gc/g1/g1BlockOffsetTable.inline.hpp"
 #include "gc/g1/g1CollectedHeap.inline.hpp"
+#include "gc/g1/g1ThreadLocalData.hpp"
 #include "gc/g1/heapRegion.inline.hpp"
 #include "logging/log.hpp"
 #include "oops/oop.inline.hpp"
@@ -285,6 +286,7 @@ void G1BlockOffsetTablePart::alloc_block_work(HeapWord** threshold_, HeapWord* b
   // that _next_offset_threshold is not updated until the end
   // of this method.
   _bot->set_offset_array(index, threshold, blk_start);
+  G1ThreadLocalData::inc_cc(Thread::current());
 
   // We need to now mark the subsequent cards that this blk spans.
 
